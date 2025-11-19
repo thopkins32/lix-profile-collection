@@ -1,295 +1,278 @@
+from collections import OrderedDict
+from ophyd.signal import (Signal, EpicsSignal, EpicsSignalRO)
+from ophyd import Device, PVPositioner, PVPositionerPC
+from ophyd import (Component as C, DynamicDeviceComponent as DDC)
+
 import time as ttime
+from bluesky.protocols import NamedMovable, Readable, Status, Hints, HasHints, HasParent
 from typing import Any
 import pandas as pd
 import scipy as sp
 import cv2
+from unittest.mock import MagicMock
 
 from ophyd import Device, EpicsSignal
 from ophyd import Component as Cpt
+from ophyd.sim import instantiate_fake_device
 
 from bluesky.utils import MsgGenerator
 import bluesky.plan_stubs as bps
 import bluesky.plans as bp
+from bluesky import RunEngine
 import numpy as np
-
-
+from tiled.client.container import Container
 
 from blop import DOF, Objective, Agent, DOFConstraint
 from blop.ax import Agent as AxAgent
 from blop.plans import acquire
+import blop.data_access
+
+class AlwaysSuccessfulStatus(Status):
+    def add_callback(self, callback) -> None:
+        callback(self)
+
+    def exception(self, timeout = 0.0):
+        return None
+    
+    @property
+    def done(self) -> bool:
+        return True
+    
+    @property
+    def success(self) -> bool:
+        return True
 
+class ReadableSignal(Readable, HasHints, HasParent):
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self.cam = MagicMock()
+        self.cam.name = name
+        self._value = 0.0
 
-def list_scan_with_delay(*args, delay=0, bimorph=bimorph, **kwargs):
-    "Accepts all the normal 'scan' parameters, plus an optional delay."
+    @property
+    def name(self) -> str:
+        return self._name
 
-    def arm_residuals(bimorph):
-        return (bimorph.all_armed_voltages() - bimorph.all_setpoint_voltages())[12:24]
-        
-    def ramp_residuals(bimorph):
-        return (bimorph.all_current_voltages.get() - bimorph.all_setpoint_voltages())[12:24]
+    @property
+    def hints(self) -> Hints:
+        return { 
+            "fields": [self._name],
+            "dimensions": [],
+            "gridding": "rectilinear",
+        }
+    
+    @property
+    def parent(self) -> Any | None:
+        return None
 
-    def one_nd_step_with_delay(detectors, step, pos_cache):
-        "This is a copy of bluesky.plan_stubs.one_nd_step with a sleep added."
+    def read(self):
+        return {
+            self._name: { "value": self._value, "timestamp": ttime.time() }
+        }
 
-        motors = step.keys()
+    def describe(self):
+        return {
+            self._name: { "source": self._name, "dtype": "number", "shape": [] }
+        }
 
-        yield from bps.move_per_step(step, pos_cache)
+class MovableSignal(ReadableSignal, NamedMovable):
+    def __init__(self, name: str, initial_value: float = 0.0) -> None:
+        super().__init__(name)
+        self._value: float = initial_value
 
-        timeout_ms = 10e3
-        tolerance_volts = 1e0
-        check_every_ms = 1e3
+    def set(self, value: float) -> Status:
+        self._value = value
+        return AlwaysSuccessfulStatus()
 
-        start_time = ttime.monotonic()
-        while not all(np.abs(arm_residuals(bimorph)) < tolerance_volts):
-            
-            print(f"arming... (residuals = {np.array2string(arm_residuals(bimorph), precision=0, floatmode='fixed')} V)")
-            time.sleep(1e-3*check_every_ms)
+class Channel(PVPositionerPC):
+    '''Bimorph Channel'''
+    setpoint = C(EpicsSignal, '_SP.VAL')
+    readback = C(EpicsSignalRO, '_CURRENT_MON_VAL.VAL')
+    armed_voltage = C(EpicsSignalRO, '_SP_MON.VAL')
+    #target_voltage = C(EpicsSignalRO, '_TARGET_MON_VAL.VAL')
+    #min_voltage = C(EpicsSignalRO, '_MINV_MON.VAL')
+    #max_voltage = C(EpicsSignalRO, '_MAXV_MON.VAL')
 
-            if 1e3 * (ttime.monotonic() - start_time) > timeout_ms:
-                raise TimeoutError()
+    # done = Cpt(Signal, value=0)
 
-        yield from bimorph.start_plan()
+    # done_value = 0
 
-        start_time = ttime.monotonic()
-        while not all(np.abs(ramp_residuals(bimorph)) < tolerance_volts):
+    # def read(self):
 
-            print(f"ramping... (residuals = {np.array2string(ramp_residuals(bimorph), precision=0, floatmode='fixed')} V)")
-            time.sleep(1e-3*check_every_ms)
+    #     res = super().read()
+    #     for key in res.keys():
+    #         value = res[key]["value"]
+    #         value = np.atleast_1d(value)
+    #         if len(value) > 0:
+    #             value = value[0]
+    #         res[key]["value"] = value
 
-            if 1e3 * (ttime.monotonic() - start_time) > timeout_ms:
-                raise TimeoutError()
+    #     return res
 
-        yield from bps.sleep(1.0)
-        yield from bps.trigger_and_read(list(detectors) + list(motors))
+    # def describe(self):
 
+    #     res = super().describe()
 
-    kwargs.setdefault("per_step", one_nd_step_with_delay)
-    uid = yield from bp.list_scan(*args, **kwargs)
-    return uid
+    #     for key in res.keys():
 
+    #         res[key]["shape"] = []
+    #         res[key]["dtype"] = "integer" if "done" in key else "number"
 
-#     kwargs.setdefault("per_step", one_nd_step_with_delay)
-#     uid = yield from bp.list_scan(*args, **kwargs)
-#     return uid
+    #     return res
 
-def bimorph_acquisition_plan(dofs, inputs, dets, **kwargs):
-    delay = kwargs.get("delay", 0)
-    args = []
-    for dof, points in zip(dofs, np.atleast_2d(inputs).T):
-        args.append(dof)
-        args.append(list(points))
 
-    yield from bps.mv(scnSS.y, 0)
-    yield from bps.sleep(1.0)
+    #done = Cpt(EpicsSignalRO, 'Cmd-Busy')
+    #stop_signal = Cpt(EpicsSignal, 'Cmd-Cmd')
 
-    uid = yield from list_scan_with_delay(dets, *args, delay=delay)
 
-    yield from bps.mv(scnSS.y, 3)
+    # def set(self, value):
 
-    return uid
+    #     # if (value < self.min_voltage.get()):
+    #     #     raise ValueError("Desired voltage is too low!")
+    #     # if (value > self.max_voltage.get()):
+    #     #     raise ValueError("Desired voltage is too high!")
 
 
-def digestion(db, uid):
 
-    products = db[uid].table(fill=True)
+    #     return st
 
-    products["cropped_image"] = pd.Series(dtype="object")
+    # def get(self):
 
-    products["processed_image"] = pd.Series(dtype="object")
+    #     return self.setpoint.get()
 
-    products["beam_profile_y"] = pd.Series(dtype="object")
 
+def add_channels(range_, **kwargs):
+    '''Add one or more Channel to an Bimorph instance
+       Parameters:
+       -----------
+       range_ : sequence of ints
+           Must be be in the set [0,31]
+       By default, an Bimorph is initialized with all 32 channels.
+       These provide the following Cs as EpicsSignals (N=[0,31]):
+       Bimorph.channels.channelN.(fields...)
+       '''
+    defn = OrderedDict()
 
-    cropped_images = []
+    for ch in range_:
+        if not (0 <= ch < 32):
+            raise ValueError('Channel must be in the set [0,31]')
 
-    processed_images = []
+        attr = 'channel{}'.format(ch)
+        defn[attr] = (Channel, ':U{}'.format(ch), kwargs)
 
-    for index, entry in products.iterrows():
 
-        print(index)
+    return defn
 
-        x_min = entry.camSS_roi1_min_xyz_min_x
-        y_min = entry.camSS_roi1_min_xyz_min_y
+class Bimorph(Device):
+    '''Bimorph HV Power Source'''
 
-        x_max = x_min + entry.camSS_roi1_size_x
-        y_max = y_min + entry.camSS_roi1_size_y
+    bank_no = C(EpicsSignal, ':BANK_NO_32.VAL')
+    step_size = C(EpicsSignal, ':U_STEP.VAL')
+    inc_bank = C(EpicsSignal, ':INCR_U_BANK_CMD.PROC')
+    dec_bank = C(EpicsSignal, ':DECR_U_BANK_CMD.PROC')
+    stop_ramp = C(EpicsSignal, ':STOP_RAMPS_BANK.PROC')
+    start_ramp = C(EpicsSignal, ':START_RAMPS_CMD.PROC')
 
-        image = entry.camSS_image[0]
+    format_number = C(EpicsSignal, ':FORMAT_NO_SP.VAL')
+    load_format = C(EpicsSignal, ':FORMAT_ACTIVE_SP.PROC')
 
-        cim = image[y_min:y_max, x_min:x_max].astype(float).sum(axis=-1)
+    all_target_voltages = C(EpicsSignalRO, ':U_ALL_TARGET_MON.VAL')
+    all_current_voltages = C(EpicsSignalRO, ':U_ALL_CURRENT_MON.VAL')
 
-        cropped_images.append(cim)
+    unit_status = C(EpicsSignalRO, ':UNIT_STATUS_MON.A')
 
-        n_y, n_x = cim.shape
+    channels = DDC(add_channels(range(0, 32)))
 
-        fcim = sp.ndimage.median_filter(cim, size=1)
-        fcim = fcim - np.median(fcim, axis=1)[:, None]
+    def step(self, bank, size, direction, start=False, wait=False):
+        self.bank_no.put(bank)
+        self.step_size.put(size)
 
-        THRESHOLD = 0.1 * fcim.max()
+        if(direction == "inc"):
+            self.inc_bank.put(1)
+        else:
+            self.dec_bank.put(1)
 
-        mfcim = np.where(fcim > THRESHOLD, fcim, 0)
+        if(start):
+            self.start()
 
-        x_weight = mfcim.sum(axis=0)
-        y_weight = mfcim.sum(axis=1)
+        if(wait):
+            self.wait()
 
-        time = ttime.time()
+    def increment_bank(self, bank, size, start=False, wait=False):
+        ''' Increments the target voltage in `size` Volts in the specified `bank`
 
-        #$plt.plot(x_weight)
-        # plt.figure()
-        # plt.imshow(cim, aspect="auto")
-        # plt.savefig(f"{int(time)}.png")
-        #plt.plot(y_weight)
+        Parameters:
+        -----------
+        bank : int
+            The number of the bank to be incremented
+        size : float
+            The amount of Volts to increment from the bank target value
+        start : bool
+            Determines if the ramp must start right after the increment. Defaults to False.
+        wait : bool
+            Determines if the code must wait until the ramp process finishes. Defaults to False.
+        '''
+        self.step(bank, size, "inc", start)
 
-        x = np.arange(n_x)
-        y = np.arange(n_y)
+    def decrement_bank(self, bank, size, start=False, wait=False):
+        ''' Decrements the target voltage in `size` Volts in the specified `bank`
 
-        x0 = np.sum(x_weight * x) / np.sum(x_weight)
-        y0 = np.sum(y_weight * y) / np.sum(y_weight)
+        Parameters:
+        -----------
+        bank : int
+            The number of the bank to be decremented
+        size : float
+            The amount of Volts to decrement from the bank target value
+        start : bool
+            Determines if the ramp must start right after the decrement. Defaults to False.
+        wait : bool
+            Determines if the code must wait until the ramp process finishes. Defaults to False.
+        '''
+        self.step(bank, size, "dec", start)
 
-        xw = 2 * np.sqrt((np.sum(x_weight * x**2) / np.sum(x_weight) - x0**2))
-        yw = 2 * np.sqrt((np.sum(y_weight * y**2) / np.sum(y_weight) - y0**2))
+    def start(self):
+        ''' Start the Ramping process on all channels '''
+        self.start_ramp.put(1)
 
-        area_pixels = (mfcim > THRESHOLD).sum()
+    def stop(self):
+        ''' Stops the Ramping process on all channels '''
+        self.stop_ramp.put(1)
 
-        processed_images.append(mfcim)
+    def start_plan(self):
+        yield from bps.mv(self.start_ramp, 1)
 
-        products.loc[index, "area"] = area_pixels
+    def is_ramping(self):
+        ''' Returns wether the power supply is ramping or not '''
+        return (int(self.unit_status.get()) >> 30) == 1
 
-        products.at[index, "beam_profile_y"] = y_weight
+    def is_interlock_ok(self):
+        ''' Returns the interlock state '''
+        st = int(self.unit_status.get())
+        return (st & 1) & ((st >> 1) & 1) == 1
 
-        # bad = False
-        # bad |= x0 < 16
-        # bad |= x0 > nx - 16
-        # bad |= y0 < 16
-        # bad |= y0 > ny - 16
+    def is_on(self):
+        ''' Returns wether the Channels are ON or OFF '''
+        return (int(self.unit_status.get()) >> 29) == 1          
 
-        # if bad:
-        #     x0, xw, y0, yw = 4 * [np.nan]
+    def wait(self):
+        while self.is_ramping():
+          sleep(0.1)
 
-        products.loc[index, "pos_x"] = x0
-        products.loc[index, "pos_y"] = y0
-        products.loc[index, "wid_x"] = xw 
-        products.loc[index, "wid_y"] = yw
+    def all_armed_voltages(self):
+        return np.array([getattr(self, f"channels.channel{i}.armed_voltage").get() for i in range(32)], dtype=np.float32).ravel()
 
-    products.loc[:, "cropped_image"] = cropped_images
-    products.loc[:, "processed_image"] = processed_images
+    def all_setpoint_voltages(self):
+        return np.array([getattr(self, f"channels.channel{i}.setpoint").get() for i in range(32)], dtype=np.float32).ravel()
 
-    return products
 
-
-fid_voltages = bimorph.all_target_voltages.get()   
-
-
-# first 12 are horizontal
-# second 12 are vertical
-# last 8?????
-
-fid_voltages = [-253. , -261. , -260. , -260. , -266.8, -260. , -469.3, -260. ,
-                -260. , -590.7, -260. , -510.7, -321. , -371. , -270. , -270. ,
-                -195. , -195. , -195. , -195. , -195. , -195. , -195. , -195. ,
-                    0. ,    0. ,    0. ,    0. ,    0. ,    0. ,    0. ,    0. ]
-
-
-dofs = []
-
-voltage_radius = 400
-
-for i in range(12):
-
-
-    device = getattr(pseudo_bimorph, f"r{i}")
-    device.readback.name = device.name
-
-    center = device.read()[device.name]["value"]
-
-    dof = DOF(device=device, 
-              description=f"piezo {i}", 
-              search_bounds=(center-100, center+100),
-              units="V",
-              )
-
-
-    device = getattr(pseudo_bimorph, f"p{i}")
-    #device.readback.name = device.name
-
-    center = 0 #device.read()[device.name]["value"]
-
-    pseudo_radius = 500. / (2. ** i)
-
-    dof = DOF(device=device, 
-              description=(f"pseudo {i}"), 
-              search_bounds=(center-pseudo_radius, center+pseudo_radius),
-              units="V",
-              )
-
-
-    dofs.append(dof)
-
-objectives = [
-    Objective(name="wid_y", description="beam height", log=True, target="min")
-]
-
-#scnSS = setup_cam('camSS')
-
-scnSS.cam.ext_trig = False
-
-dets = [scnSS.cam]
-
-agent = Agent(dofs=dofs, 
-                objectives=objectives, 
-                dets=dets, 
-                digestion=digestion, 
-                acquistion_plan=bimorph_acquisition_plan, 
-                db=db,
-                verbose=True,
-                trigger_delay=0.1)
-
-# agent.dofs.deactivate()
-
-for dof in agent.dofs[6:]:
-    dof.active = False
-
-agent.dofs[0].search_bounds = (-100, 100)
-agent.dofs[1].search_bounds = (-100, 100)
-agent.dofs[2].search_bounds = (-100, 100)
-agent.dofs[3].search_bounds = (-100, 100)
-agent.dofs[4].search_bounds = (-100, 100)
-agent.dofs[5].search_bounds = (-100, 100)
-
-def plot_all_profiles(agent, axis=0):
-
-    images = np.array(agent.table.cropped_image.values)
-
-    for im in images:
-
-        plt.plot(im.sum(axis=axis))
-
-def plot_all_images(agent):
-
-    images = np.array(agent.table.cropped_image.values)
-
-    nx = int(np.sqrt(len(images)))
-    ny = len(images) // nx + 1
-
-    fig, axes = plt.subplots(nx, ny, figsize=(nx, ny))
-
-    axes = np.atleast_2d(axes)
-
-    for iax in range(len(images)):
-
-        im = images[iax]
-        ax = axes.ravel()[iax]
-
-        ax.imshow(im)
-
-
-from ophyd.pseudopos import (
-    PseudoPositioner,
-    PseudoSingle,
-    pseudo_position_argument,
-    real_position_argument
-)
-from ophyd import Component, SoftPositioner
+RE = RunEngine({})
+bimorph = instantiate_fake_device(Bimorph, name="bimorph")
+scnSS = ReadableSignal(name="scnSS")
+db = MagicMock(spec=Container)
+blop.data_access.TiledDataAccess.get_data = MagicMock(return_value={"scnSS_image": [np.random.randint(0, 255, (100, 100)).astype(np.uint16)]})
+def mock_move_per_step(step, pos_cache):
+    yield from bps.null()
+bps.move_per_step = mock_move_per_step
 
 import numpy as np
 import scipy as sp
@@ -429,11 +412,12 @@ def vertical_profile_digestion(
     edge_crop : int, optional
         The number of pixels to crop from the edges of the image. Default to 0.
     """
-    image = readings[f"{scnSS.cam.name}_image"][trial_index]
+    image = readings[f"{scnSS.cam.name}_image"][0]
     _, _, metrics_dict = vertical_profile_metric(image, threshold_factor=threshold_factor, edge_crop=edge_crop)
+    print(f"Metrics dict: {metrics_dict}")
     return {
-        "vertical_coefficient_variation": metrics_dict["cv"],
-        "total_vertical_intensity": metrics_dict["total_intensity"],
+        "vertical_coefficient_variation": metrics_dict["cv"].item(),
+        "total_vertical_intensity": metrics_dict["total_intensity"].item(),
     }
 
 
@@ -568,9 +552,11 @@ def one_nd_bimorph_step(detectors, step, pos_cache, take_reading=None, *, bimorp
 
     if take_reading is None:
         take_reading = bps.trigger_and_read
-    
+    print("[one_nd_bimorph_step] take_reading determined")
+
     if bimorph_device is None:
         bimorph_device = bimorph
+    print("[one_nd_bimorph_step] bimorph_device determined")
 
     def _armed() -> bool:
         armed_voltages = np.array(bimorph_device.all_armed_voltages(), dtype=np.float32)
@@ -579,11 +565,14 @@ def one_nd_bimorph_step(detectors, step, pos_cache, take_reading=None, *, bimorp
     def _ramped() -> bool:
         current_voltages = np.array(bimorph_device.all_current_voltages.get(), dtype=np.float32)
         return np.allclose(current_voltages, bimorph_device.all_setpoint_voltages(), atol=tolerance)
+    print("[one_nd_bimorph_step] _armed and _ramped checkers defined")
     
     # Move to the next position (change setpoints for bimorph channels)
+    print("[one_nd_bimorph_step] Moving to next position (setpoints for bimorph channels)")
     yield from bps.move_per_step(step, pos_cache)
 
     # Wait for the bimorph mirror to be armed
+    print("[one_nd_bimorph_step] Waiting for bimorph mirror to be armed...")
     start_time = ttime.monotonic()
     while not _armed():
         yield from bps.sleep(poll_interval)
@@ -591,9 +580,11 @@ def one_nd_bimorph_step(detectors, step, pos_cache, take_reading=None, *, bimorp
             raise TimeoutError(f"Failed to arm the bimorph mirrors within {timeout} seconds")
 
     # Start ramping
+    print("[one_nd_bimorph_step] Starting ramping")
     yield from bimorph_device.start_plan()
 
     # Wait for the bimorph mirror to be ramped
+    print("[one_nd_bimorph_step] Waiting for bimorph mirror to be ramped...")
     start_time = ttime.monotonic()
     while not _ramped():
         yield from bps.sleep(poll_interval)
@@ -601,9 +592,11 @@ def one_nd_bimorph_step(detectors, step, pos_cache, take_reading=None, *, bimorp
             raise TimeoutError(f"Failed to ramp the bimorph mirrors within {timeout} seconds")
 
     # settle time after ramping
+    print("[one_nd_bimorph_step] Settling after ramping...")
     yield from bps.sleep(1.0)
 
     # Take a reading from the detectors
+    print("[one_nd_bimorph_step] Taking a reading from detectors and step movers...")
     yield from take_reading(list(detectors) + list(step.keys()))
 
 
@@ -619,6 +612,6 @@ def optimize_vertical_profile(iterations: int = 30) -> MsgGenerator[None]:
             trials,
             per_step=one_nd_bimorph_step,
         )
-        results = uniform_vertical_profile_agent.data_access.get(uid)
+        results = uniform_vertical_profile_agent.data_access.get_data(uid)
         data = {trial_index: uniform_vertical_profile_agent.digestion(trial_index, results, **uniform_vertical_profile_agent.digestion_kwargs) for trial_index in trials.keys()} 
         uniform_vertical_profile_agent.complete_trials(data)
