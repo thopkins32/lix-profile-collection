@@ -295,11 +295,14 @@ def vertical_profile_metric(image, background=None, threshold_factor=0.1,
     :param edge_crop: Number of pixels to crop from the edges of the image. Default to 0.
     :return: Tuple (metric: float, debug_image: OpenCV image, metrics_dict: dict)
     """
+    print(f"Image: {image}")
     # Convert to grayscale
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
         gray = image.copy()
+
+    print(f"{gray=}")
     
     debug_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR) if len(gray.shape) == 2 else image.copy()
 
@@ -317,17 +320,21 @@ def vertical_profile_metric(image, background=None, threshold_factor=0.1,
             background = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
     corrected = cv2.subtract(gray, background)
     corrected = cv2.GaussianBlur(corrected, (5, 5), 0)
+    print(f"{corrected=}")
     
     max_intensity = np.max(corrected)
     if max_intensity == 0:
         return float('inf'), debug_img, {}
         
     thresh_value = threshold_factor * max_intensity
-    _, thresh = cv2.threshold(corrected, thresh_value, 255, cv2.THRESH_BINARY)
+    print(f"{thresh_value=}")
+    _, thresh = cv2.threshold(corrected, thresh_value, 255, cv2.THRESH_TOZERO)
+    print(f"{thresh=}")
     
     # ========== VERTICAL PROFILE ==========
-    # Collapse to 1D vertical profile by averaging over horizontal (x) axis
-    vertical_profile = np.mean(thresh, axis=1)  # Average over horizontal direction
+    # Collapse to 1D vertical profile by summing over horizontal (x) axis
+    vertical_profile = np.sum(thresh, axis=1)  # Sum over horizontal direction
+    print(f"{vertical_profile=}")
     
     if len(vertical_profile) == 0 or np.sum(vertical_profile) == 0:
         return float('inf'), debug_img, {}
@@ -614,4 +621,4 @@ def optimize_vertical_profile(iterations: int = 30) -> MsgGenerator[None]:
         )
         results = uniform_vertical_profile_agent.data_access.get_data(uid)
         data = {trial_index: uniform_vertical_profile_agent.digestion(trial_index, results, **uniform_vertical_profile_agent.digestion_kwargs) for trial_index in trials.keys()} 
-        uniform_vertical_profile_agent.complete_trials(data)
+        uniform_vertical_profile_agent.complete_trials(trials, data)
